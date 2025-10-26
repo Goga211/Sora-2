@@ -4,13 +4,15 @@ import asyncio
 import logging
 import aiohttp
 from dotenv import load_dotenv
+from typing import Dict, Set
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    LabeledPrice, PreCheckoutQuery
+    LabeledPrice, PreCheckoutQuery,
+    ReplyKeyboardMarkup, KeyboardButton
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -37,6 +39,11 @@ JOBS_STATUS = f"{KIE_API_BASE}/api/v1/jobs/recordInfo"
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+
+# Храним id последнего инвойса на пользователя, чтобы удалить его после оплаты
+LAST_INVOICE_MSG: Dict[int, int] = {}
+# Fallback-набор, если в БД нет идемпотентного метода
+APPLIED_CHARGES: Set[str] = set()
 
 # ──────────────────────────── Состояния ───────────────────────────────
 class VideoCreationStates(StatesGroup):
@@ -92,11 +99,24 @@ def back_btn(data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text="🔙 Назад", callback_data=data)
 
 def get_main_keyboard():
+    # Оставляем инлайн-меню для экрана, если хочется кнопки под сообщением
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎬 Создать видео", callback_data="create_video")],
         [InlineKeyboardButton(text="💰 Баланс", callback_data="check_balance")],
         [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="top_up_balance")]
     ])
+
+def get_reply_keyboard() -> ReplyKeyboardMarkup:
+    # Постоянное «нижнее» меню под полем ввода
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎬 Создать видео")],
+            [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="💳 Пополнить баланс")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Выберите действие…"
+    )
 
 def get_prompt_type_keyboard(selected: str | None = None):
     t2v = "✅ Текст → Видео" if selected == "t2v" else "Текст → Видео"
@@ -178,16 +198,20 @@ async def cmd_start(message: types.Message):
         "2️⃣ Модель: Sora 2 / Sora 2 Pro (Стандарт/Высокое)\n"
         "3️⃣ Выбери длительность и ориентацию\n"
         "4️⃣ Опиши сцену — и готово!\n\n"
-        "💰 Баланс — «Баланс», пополнение — «Пополнить баланс»."
+        "💳 Пополнить — внизу, кнопка ⭐/💵. Баланс — «💰 Баланс»."
     )
-    await message.answer(text, reply_markup=get_main_keyboard())
+    await message.answer(text, reply_markup=get_reply_keyboard())
 
-# старт
+@dp.message(Command("menu"))
+async def cmd_menu(message: Message):
+    await message.answer("Нижнее меню включено.", reply_markup=get_reply_keyboard())
+
+# старт из инлайна
 @dp.callback_query(F.data == "create_video")
 async def start_create_video(callback: CallbackQuery, state: FSMContext):
     uid = callback.from_user.id
     if not await db.has_generations(uid):
-        await callback.message.edit_text("❌ У вас нет токенов. Пополните баланс.", reply_markup=get_main_keyboard())
+        await callback.message.edit_text("❌ У вас нет токенов. Нажмите «💳 Пополнить баланс».")
         return
     await state.set_state(VideoCreationStates.waiting_for_prompt_type)
     await state.update_data(prompt_type=None, tier=None, quality=None,
@@ -195,10 +219,25 @@ async def start_create_video(callback: CallbackQuery, state: FSMContext):
                             image_url=None, prompt=None, cost=None, kie_model=None)
     await callback.message.edit_text("Выберите тип промпта:", reply_markup=get_prompt_type_keyboard())
 
-# назад в главное меню
+# старт из нижнего меню
+@dp.message(F.text == "🎬 Создать видео")
+async def menu_create_video(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    if not await db.has_generations(uid):
+        await message.answer("❌ У вас нет токенов. Нажмите «💳 Пополнить баланс».")
+        return
+    await state.set_state(VideoCreationStates.waiting_for_prompt_type)
+    await state.update_data(
+        prompt_type=None, tier=None, quality=None,
+        duration=None, orientation=None,
+        image_url=None, prompt=None, cost=None, kie_model=None
+    )
+    await message.answer("Выберите тип промпта:", reply_markup=get_prompt_type_keyboard())
+
+# назад в «главное» (оставляем нижнюю клавиатуру)
 @dp.callback_query(F.data == "back_to_main")
 async def back_to_main(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("🏠 Главное меню", reply_markup=get_main_keyboard())
+    await callback.message.edit_text("🏠 Главное меню. Используйте кнопки внизу.")
     await state.clear()
 
 # выбор типа промпта
@@ -246,7 +285,6 @@ async def choose_quality(callback: CallbackQuery, state: FSMContext):
         await state.update_data(quality=q)
         await callback.message.edit_reply_markup(reply_markup=get_quality_keyboard(selected=q))
         return
-    # Далее → длительность + ориентация
     tier, q = data.get("tier"), data.get("quality")
     await state.set_state(VideoCreationStates.waiting_for_duration_orientation)
     await callback.message.edit_text(
@@ -410,8 +448,7 @@ async def confirm_video(callback: CallbackQuery, state: FSMContext):
     if not user or user["generations_left"] < cost:
         bal = user["generations_left"] if user else 0
         await callback.message.edit_text(
-            f"❌ Недостаточно токенов.\nНужно {cost}, у вас {bal}.",
-            reply_markup=get_main_keyboard()
+            f"❌ Недостаточно токенов.\nНужно {cost}, у вас {bal}."
         )
         await state.clear()
         return
@@ -439,12 +476,29 @@ async def confirm_video(callback: CallbackQuery, state: FSMContext):
         await state.clear()
 
 # ─────────────── Баланс и пополнение ────────────────
+@dp.message(F.text == "💰 Баланс")
+async def menu_check_balance(message: Message):
+    uid = message.from_user.id
+    user = await db.get_user(uid)
+    txt = f"💰 Ваш баланс:\n\n🪙 Токенов: {user['generations_left']}" if user else "❌ Пользователь не найден"
+    await message.answer(txt)
+
+@dp.message(F.text == "💳 Пополнить баланс")
+async def menu_top_up_balance(message: Message, state: FSMContext):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Звёзды", callback_data="pay_stars")],
+        [InlineKeyboardButton(text="💵 Рубли (скоро)", callback_data="pay_rub")],
+        [back_btn("back_to_main")],
+    ])
+    await message.answer("💳 Выберите способ пополнения:", reply_markup=kb)
+    await state.set_state(BalanceStates.waiting_for_payment_method)
+
 @dp.callback_query(F.data == "check_balance")
 async def check_balance_cb(callback: CallbackQuery):
     uid = callback.from_user.id
     user = await db.get_user(uid)
     txt = f"💰 Ваш баланс:\n\n🪙 Токенов: {user['generations_left']}" if user else "❌ Пользователь не найден"
-    await callback.message.edit_text(txt, reply_markup=get_main_keyboard())
+    await callback.message.edit_text(txt)
 
 @dp.callback_query(F.data == "top_up_balance")
 async def top_up_balance_cb(callback: CallbackQuery, state: FSMContext):
@@ -456,7 +510,7 @@ async def top_up_balance_cb(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("💳 Выберите способ пополнения:", reply_markup=kb)
     await state.set_state(BalanceStates.waiting_for_payment_method)
 
-# Рубли — пока заглушка
+# Рубли — заглушка
 @dp.callback_query(F.data == "pay_rub")
 async def pay_rub_cb(callback: CallbackQuery, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -507,14 +561,13 @@ async def stars_package_cb(callback: CallbackQuery):
         "uid": uid
     })
 
-    # ВАЖНО: для Telegram Stars -> provider_token="" и currency="XTR"
-    # prices должен содержать РОВНО один LabeledPrice; amount = кол-во звёзд
-    prices = [LabeledPrice(label=pkg["title"], amount=pkg["stars"])]
+    # Stars: provider_token="" и currency="XTR"; prices — ровно один элемент
+    prices = [LabeledPrice(label=f"{pkg['stars']} ⭐", amount=pkg["stars"])]
 
-    await bot.send_invoice(
+    msg = await bot.send_invoice(
         chat_id=uid,
         title="Пополнение токенов",
-        description=pkg["title"],
+        description=f"{pkg['stars']} ⭐ → {pkg['tokens']} токенов",
         payload=payload,
         provider_token="",           # Stars
         currency="XTR",              # Stars
@@ -522,18 +575,16 @@ async def stars_package_cb(callback: CallbackQuery):
         start_parameter=f"stars_{pack}_{uid}",
         is_flexible=False,
     )
+    LAST_INVOICE_MSG[uid] = msg.message_id
 
 # ────────────── Payments: pre-checkout + successful_payment ────────────
 @dp.pre_checkout_query()
 async def on_pre_checkout(pcq: PreCheckoutQuery):
-    # нужно ответить ≤ 10 сек, иначе платёж не пройдёт
+    # Ответить ≤ 10 сек
     try:
         await bot.answer_pre_checkout_query(pcq.id, ok=True)
     except Exception:
         logging.exception("pre_checkout answer error")
-
-# Fallback для идемпотентности, если в БД нет метода apply_star_payment
-APPLIED_CHARGES: set[str] = set()
 
 @dp.message(F.successful_payment)
 async def on_successful_stars_payment(message: Message):
@@ -559,7 +610,7 @@ async def on_successful_stars_payment(message: Message):
         )
 
     applied = False
-    # Сначала пробуем надёжный метод из твоей БД:
+    # Надёжный путь — метод БД apply_star_payment (уникальный charge_id)
     try:
         if hasattr(db, "apply_star_payment"):
             applied = await db.apply_star_payment(
@@ -570,7 +621,7 @@ async def on_successful_stars_payment(message: Message):
                 raw_payload=payload,
             )
         else:
-            # Временный fallback: на время жизни процесса
+            # Fallback на время жизни процесса
             if charge_id in APPLIED_CHARGES:
                 applied = False
             else:
@@ -579,7 +630,6 @@ async def on_successful_stars_payment(message: Message):
                 applied = True
     except Exception:
         logging.exception("apply_star_payment error")
-        # на всякий случай — чтобы пользователь не потерял оплату
         try:
             await db.add_generations(uid, tokens)
             applied = True
@@ -593,6 +643,18 @@ async def on_successful_stars_payment(message: Message):
         )
     else:
         await message.answer("ℹ️ Этот платёж уже был учтён ранее.")
+
+    # Удаляем чек (это текущее сообщение) и инвойс из чата для «чистоты»
+    try:
+        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    except Exception:
+        pass
+    mid = LAST_INVOICE_MSG.pop(uid, None)
+    if mid:
+        try:
+            await bot.delete_message(chat_id=message.chat.id, message_id=mid)
+        except Exception:
+            pass
 
 # ───────────────────────── Интеграция с KIE ───────────────────────────
 def _input_payload(prompt: str, duration: int, orientation: str,
