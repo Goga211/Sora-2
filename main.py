@@ -7,7 +7,11 @@ from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    LabeledPrice, PreCheckoutQuery
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -39,7 +43,7 @@ class VideoCreationStates(StatesGroup):
     waiting_for_prompt_type = State()
     waiting_for_model_tier = State()
     waiting_for_quality = State()               # только для Pro
-    waiting_for_duration_orientation = State()  # для всех: длительность + ориентация
+    waiting_for_duration_orientation = State()  # длительность + ориентация
     waiting_for_image = State()
     waiting_for_prompt = State()
     waiting_for_confirmation = State()
@@ -162,7 +166,7 @@ def _build_kie_model(ptype: str, tier: str, quality: str | None) -> str:
     if ptype == "i2v" and tier == "sora2_pro":  return "sora-2-pro-image-to-video"
     return "sora-2-text-to-video"
 
-# ─────────────────────────────── Хэндлеры UI ──────────────────────────────────
+# ─────────────────────────────── Хэндлеры UI ──────────────────────────
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     uid = message.from_user.id
@@ -289,7 +293,7 @@ async def orientation_cb(callback: CallbackQuery, state: FSMContext):
         )
     )
 
-# Далее → просим картинку или текст
+# Далее → картинка или текст
 @dp.callback_query(F.data == "continue_video")
 async def cont_video(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -434,7 +438,7 @@ async def confirm_video(callback: CallbackQuery, state: FSMContext):
     finally:
         await state.clear()
 
-# ─────────────── Баланс и пополнение (лоты обновлены) ────────────────
+# ─────────────── Баланс и пополнение ────────────────
 @dp.callback_query(F.data == "check_balance")
 async def check_balance_cb(callback: CallbackQuery):
     uid = callback.from_user.id
@@ -445,14 +449,14 @@ async def check_balance_cb(callback: CallbackQuery):
 @dp.callback_query(F.data == "top_up_balance")
 async def top_up_balance_cb(callback: CallbackQuery, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💵 Рубли", callback_data="pay_rub")],
         [InlineKeyboardButton(text="⭐ Звёзды", callback_data="pay_stars")],
+        [InlineKeyboardButton(text="💵 Рубли (скоро)", callback_data="pay_rub")],
         [back_btn("back_to_main")]
     ])
     await callback.message.edit_text("💳 Выберите способ пополнения:", reply_markup=kb)
     await state.set_state(BalanceStates.waiting_for_payment_method)
 
-# Рубли — лоты 30/100/200/500 (1:1 в токены)
+# Рубли — пока заглушка
 @dp.callback_query(F.data == "pay_rub")
 async def pay_rub_cb(callback: CallbackQuery, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -462,16 +466,23 @@ async def pay_rub_cb(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="💵 500₽ → 500 токенов", callback_data="rubles_500")],
         [back_btn("top_up_balance")]
     ])
-    await callback.message.edit_text("💵 Выберите пакет для пополнения:", reply_markup=kb)
+    await callback.message.edit_text("💵 Этот способ скоро будет доступен.\nПока используйте ⭐ Звёзды.", reply_markup=kb)
 
 # Звёзды — лоты 20/60/120/300 → 30/100/200/500 токенов
+STAR_PACKS = {
+    "20":  {"stars": 20,  "tokens": 30,  "title": "⭐ 20 звёзд → 30 токенов"},
+    "60":  {"stars": 60,  "tokens": 100, "title": "⭐ 60 звёзд → 100 токенов"},
+    "120": {"stars": 120, "tokens": 200, "title": "⭐ 120 звёзд → 200 токенов"},
+    "300": {"stars": 300, "tokens": 500, "title": "⭐ 300 звёзд → 500 токенов"},
+}
+
 @dp.callback_query(F.data == "pay_stars")
 async def pay_stars_cb(callback: CallbackQuery, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ 20 звёзд → 30 токенов",   callback_data="stars_20")],
-        [InlineKeyboardButton(text="⭐ 60 звёзд → 100 токенов",  callback_data="stars_60")],
-        [InlineKeyboardButton(text="⭐ 120 звёзд → 200 токенов", callback_data="stars_120")],
-        [InlineKeyboardButton(text="⭐ 300 звёзд → 500 токенов", callback_data="stars_300")],
+        [InlineKeyboardButton(text=STAR_PACKS["20"]["title"],   callback_data="stars_20")],
+        [InlineKeyboardButton(text=STAR_PACKS["60"]["title"],   callback_data="stars_60")],
+        [InlineKeyboardButton(text=STAR_PACKS["120"]["title"],  callback_data="stars_120")],
+        [InlineKeyboardButton(text=STAR_PACKS["300"]["title"],  callback_data="stars_300")],
         [back_btn("top_up_balance")]
     ])
     await callback.message.edit_text("⭐ Выберите пакет для пополнения:", reply_markup=kb)
@@ -481,66 +492,115 @@ async def stars_package_cb(callback: CallbackQuery):
     uid = callback.from_user.id
     pack = callback.data.split("_")[1]  # "20" | "60" | "120" | "300"
 
-    star_packs = {
-        "20":  {"stars": 20,  "tokens": 30},
-        "60":  {"stars": 60,  "tokens": 100},
-        "120": {"stars": 120, "tokens": 200},
-        "300": {"stars": 300, "tokens": 500},
-    }
-
-    if pack not in star_packs:
+    if pack not in STAR_PACKS:
         await callback.answer("❌ Неверный пакет", show_alert=True)
         return
 
-    pkg = star_packs[pack]
+    pkg = STAR_PACKS[pack]
 
-    # TODO: интеграция с Telegram Stars billing
-    await db.add_generations(uid, pkg["tokens"])
+    # payload для идемпотентности/начисления
+    payload = json.dumps({
+        "kind": "stars_pack",
+        "pack": pack,
+        "stars": pkg["stars"],
+        "tokens": pkg["tokens"],
+        "uid": uid
+    })
 
-    await callback.message.edit_text(
-        "✅ Пополнение успешно!\n\n"
-        f"⭐ Списано: {pkg['stars']} звёзд\n"
-        f"🪙 Начислено: {pkg['tokens']} токенов\n\n"
-        "Спасибо! 🎉",
-        reply_markup=get_main_keyboard()
+    # ВАЖНО: для Telegram Stars -> provider_token="" и currency="XTR"
+    # prices должен содержать РОВНО один LabeledPrice; amount = кол-во звёзд
+    prices = [LabeledPrice(label=pkg["title"], amount=pkg["stars"])]
+
+    await bot.send_invoice(
+        chat_id=uid,
+        title="Пополнение токенов",
+        description=pkg["title"],
+        payload=payload,
+        provider_token="",           # Stars
+        currency="XTR",              # Stars
+        prices=prices,
+        start_parameter=f"stars_{pack}_{uid}",
+        is_flexible=False,
     )
 
-@dp.callback_query(F.data.startswith("rubles_"))
-async def rubles_package_cb(callback: CallbackQuery):
-    uid = callback.from_user.id
-    pack = callback.data.split("_")[1]  # "30" | "100" | "200" | "500"
+# ────────────── Payments: pre-checkout + successful_payment ────────────
+@dp.pre_checkout_query()
+async def on_pre_checkout(pcq: PreCheckoutQuery):
+    # нужно ответить ≤ 10 сек, иначе платёж не пройдёт
+    try:
+        await bot.answer_pre_checkout_query(pcq.id, ok=True)
+    except Exception:
+        logging.exception("pre_checkout answer error")
 
-    rub_packs = {
-        "30":  {"rubles": 30,  "tokens": 30},
-        "100": {"rubles": 100, "tokens": 100},
-        "200": {"rubles": 200, "tokens": 200},
-        "500": {"rubles": 500, "tokens": 500},
-    }
+# Fallback для идемпотентности, если в БД нет метода apply_star_payment
+APPLIED_CHARGES: set[str] = set()
 
-    if pack not in rub_packs:
-        await callback.answer("❌ Неверный пакет", show_alert=True)
+@dp.message(F.successful_payment)
+async def on_successful_stars_payment(message: Message):
+    sp = message.successful_payment
+    if not sp or sp.currency != "XTR":
         return
 
-    pkg = rub_packs[pack]
+    # разбираем payload
+    try:
+        payload = json.loads(sp.invoice_payload or "{}")
+    except Exception:
+        payload = {}
 
-    # TODO: интеграция с платёжной системой
-    await db.add_generations(uid, pkg["tokens"])
+    uid = message.from_user.id
+    stars_paid = int(sp.total_amount)  # сколько ⭐ списано
+    charge_id = sp.telegram_payment_charge_id
+    tokens = int(payload.get("tokens") or 0)
+    pack_stars_declared = int(payload.get("stars") or 0)
 
-    await callback.message.edit_text(
-        "✅ Пополнение успешно!\n\n"
-        f"💵 Оплачено: {pkg['rubles']}₽\n"
-        f"🪙 Начислено: {pkg['tokens']} токенов\n\n"
-        "Спасибо! 🎉",
-        reply_markup=get_main_keyboard()
-    )
+    if pack_stars_declared and pack_stars_declared != stars_paid:
+        logging.warning(
+            f"Stars mismatch: declared={pack_stars_declared}, paid={stars_paid}, payload={payload}"
+        )
 
-# ───────────────────────── Интеграция с KIE ────────────────────────────
+    applied = False
+    # Сначала пробуем надёжный метод из твоей БД:
+    try:
+        if hasattr(db, "apply_star_payment"):
+            applied = await db.apply_star_payment(
+                user_id=uid,
+                telegram_payment_charge_id=charge_id,
+                stars=stars_paid,
+                tokens=tokens,
+                raw_payload=payload,
+            )
+        else:
+            # Временный fallback: на время жизни процесса
+            if charge_id in APPLIED_CHARGES:
+                applied = False
+            else:
+                await db.add_generations(uid, tokens)
+                APPLIED_CHARGES.add(charge_id)
+                applied = True
+    except Exception:
+        logging.exception("apply_star_payment error")
+        # на всякий случай — чтобы пользователь не потерял оплату
+        try:
+            await db.add_generations(uid, tokens)
+            applied = True
+        except Exception:
+            logging.exception("add_generations fallback error")
+
+    if applied:
+        await message.answer(
+            f"✅ Оплата получена: {stars_paid} ⭐\n"
+            f"🪙 Начислено: {tokens} токенов\nСпасибо! 🎉"
+        )
+    else:
+        await message.answer("ℹ️ Этот платёж уже был учтён ранее.")
+
+# ───────────────────────── Интеграция с KIE ───────────────────────────
 def _input_payload(prompt: str, duration: int, orientation: str,
                    image_url: str | None, tier: str, quality: str | None):
     """
     Формируем тело input:
     - n_frames, remove_watermark, prompt
-    - aspect_ratio (всегда, для обеих линеек)
+    - aspect_ratio (всегда)
     - size ('standard' | 'high') для Sora 2 Pro
     - image_urls при I2V
     """
@@ -645,7 +705,7 @@ async def check_video_status(uid: int, task_id: str, duration: int, orientation:
         await db.add_generations(uid, cost)
         await bot.send_message(uid, "❌ Ошибка при генерации. Токены возвращены.")
 
-# ───────────────────────────── Точка входа ────────────────────────────────────
+# ───────────────────────────── Точка входа ────────────────────────────
 async def main():
     try:
         await db.connect()
