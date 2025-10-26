@@ -18,6 +18,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
+# YooKassa (без вебхуков — будем опрашивать статус)
+from yookassa import Configuration, Payment
+
 from database import db  # ваш модуль Database с глобальным экземпляром db
 
 # ──────────────────────────── Настройка ───────────────────────────────
@@ -28,19 +31,30 @@ TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise ValueError("TOKEN не найден в .env")
 
+# KIE
 KIE_API_BASE = os.getenv("KIE_API_BASE", "https://api.kie.ai")
 KIE_API_KEY = os.getenv("KIE_API_KEY")
 if not KIE_API_KEY:
     raise ValueError("KIE_API_KEY не найден в .env")
-
 JOBS_CREATE = f"{KIE_API_BASE}/api/v1/jobs/createTask"
 JOBS_STATUS = f"{KIE_API_BASE}/api/v1/jobs/recordInfo"
+
+# YooKassa
+YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID")
+YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY")
+YOOKASSA_RETURN_URL = os.getenv("YOOKASSA_RETURN_URL", "https://t.me/your_bot_username")
+if not (YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY):
+    logging.warning("YooKassa не настроена: нет YOOKASSA_SHOP_ID/YOOKASSA_SECRET_KEY")
+
+if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
+    Configuration.account_id = YOOKASSA_SHOP_ID
+    Configuration.secret_key = YOOKASSA_SECRET_KEY
 
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# Храним id последнего инвойса на пользователя, чтобы удалить его после оплаты
+# Храним id последнего инвойса Stars на пользователя, чтобы удалить его после оплаты
 LAST_INVOICE_MSG: Dict[int, int] = {}
 # Fallback-набор, если в БД нет идемпотентного метода
 APPLIED_CHARGES: Set[str] = set()
@@ -58,7 +72,7 @@ class VideoCreationStates(StatesGroup):
 class BalanceStates(StatesGroup):
     waiting_for_payment_method = State()
 
-# ──────────────────────────── Цены ────────────────────────────────────
+# ──────────────────────────── Цены генераций ──────────────────────────
 def calc_cost_credits(tier: str, quality: str | None, duration: int) -> int:
     """
     Цены:
@@ -97,14 +111,6 @@ def duration_price_text(tier: str | None, quality: str | None) -> str:
 # ──────────────────────────── Клавиатуры ──────────────────────────────
 def back_btn(data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text="🔙 Назад", callback_data=data)
-
-def get_main_keyboard():
-    # Оставляем инлайн-меню для экрана, если хочется кнопки под сообщением
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎬 Создать видео", callback_data="create_video")],
-        [InlineKeyboardButton(text="💰 Баланс", callback_data="check_balance")],
-        [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="top_up_balance")]
-    ])
 
 def get_reply_keyboard() -> ReplyKeyboardMarkup:
     # Постоянное «нижнее» меню под полем ввода
@@ -198,26 +204,13 @@ async def cmd_start(message: types.Message):
         "2️⃣ Модель: Sora 2 / Sora 2 Pro (Стандарт/Высокое)\n"
         "3️⃣ Выбери длительность и ориентацию\n"
         "4️⃣ Опиши сцену — и готово!\n\n"
-        "💳 Пополнить — внизу, кнопка ⭐/💵. Баланс — «💰 Баланс»."
+        "💳 Пополнить — внизу (⭐ или 💵). Баланс — «💰 Баланс»."
     )
     await message.answer(text, reply_markup=get_reply_keyboard())
 
 @dp.message(Command("menu"))
 async def cmd_menu(message: Message):
     await message.answer("Нижнее меню включено.", reply_markup=get_reply_keyboard())
-
-# старт из инлайна
-@dp.callback_query(F.data == "create_video")
-async def start_create_video(callback: CallbackQuery, state: FSMContext):
-    uid = callback.from_user.id
-    if not await db.has_generations(uid):
-        await callback.message.edit_text("❌ У вас нет токенов. Нажмите «💳 Пополнить баланс».")
-        return
-    await state.set_state(VideoCreationStates.waiting_for_prompt_type)
-    await state.update_data(prompt_type=None, tier=None, quality=None,
-                            duration=None, orientation=None,
-                            image_url=None, prompt=None, cost=None, kie_model=None)
-    await callback.message.edit_text("Выберите тип промпта:", reply_markup=get_prompt_type_keyboard())
 
 # старт из нижнего меню
 @dp.message(F.text == "🎬 Создать видео")
@@ -234,7 +227,7 @@ async def menu_create_video(message: Message, state: FSMContext):
     )
     await message.answer("Выберите тип промпта:", reply_markup=get_prompt_type_keyboard())
 
-# назад в «главное» (оставляем нижнюю клавиатуру)
+# назад в «главное»
 @dp.callback_query(F.data == "back_to_main")
 async def back_to_main(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("🏠 Главное меню. Используйте кнопки внизу.")
@@ -293,7 +286,7 @@ async def choose_quality(callback: CallbackQuery, state: FSMContext):
         parse_mode="Markdown"
     )
 
-# назад с длительности/ориентации → качество (или модель, если не Pro)
+# назад с длительности/ориентации → качество (или модель)
 @dp.callback_query(F.data == "back_to_quality_or_tier")
 async def back_to_quality_or_tier(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -402,6 +395,7 @@ async def prompt_msg(message: types.Message, state: FSMContext):
     mode_human = "Text→Video" if data.get("prompt_type") == "t2v" else "Image→Video"
 
     info = [
+        "⏳ Генерация может занять до 15 минут."
         "📋 Подтвердите параметры:",
         f"Тип: {mode_human}",
         f"Модель: {tier_human}{quality_human}",
@@ -487,7 +481,7 @@ async def menu_check_balance(message: Message):
 async def menu_top_up_balance(message: Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ Звёзды", callback_data="pay_stars")],
-        [InlineKeyboardButton(text="💵 Рубли (скоро)", callback_data="pay_rub")],
+        [InlineKeyboardButton(text="💵 Рубли (YooKassa)", callback_data="pay_rub")],
         [back_btn("back_to_main")],
     ])
     await message.answer("💳 Выберите способ пополнения:", reply_markup=kb)
@@ -504,25 +498,58 @@ async def check_balance_cb(callback: CallbackQuery):
 async def top_up_balance_cb(callback: CallbackQuery, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ Звёзды", callback_data="pay_stars")],
-        [InlineKeyboardButton(text="💵 Рубли (скоро)", callback_data="pay_rub")],
+        [InlineKeyboardButton(text="💵 Рубли (YooKassa)", callback_data="pay_rub")],
         [back_btn("back_to_main")]
     ])
     await callback.message.edit_text("💳 Выберите способ пополнения:", reply_markup=kb)
     await state.set_state(BalanceStates.waiting_for_payment_method)
 
-# Рубли — заглушка
-@dp.callback_query(F.data == "pay_rub")
-async def pay_rub_cb(callback: CallbackQuery, state: FSMContext):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💵 30₽ → 30 токенов",   callback_data="rubles_30")],
-        [InlineKeyboardButton(text="💵 100₽ → 100 токенов", callback_data="rubles_100")],
-        [InlineKeyboardButton(text="💵 200₽ → 200 токенов", callback_data="rubles_200")],
-        [InlineKeyboardButton(text="💵 500₽ → 500 токенов", callback_data="rubles_500")],
-        [back_btn("top_up_balance")]
-    ])
-    await callback.message.edit_text("💵 Этот способ скоро будет доступен.\nПока используйте ⭐ Звёзды.", reply_markup=kb)
+# ──────────────────────────── Команда /get_id ────────────────────────────
+@dp.message(Command("get_id"))
+async def cmd_get_id(message: types.Message):
+    uid = message.from_user.id
+    await message.answer(f"🆔 Ваш Telegram ID: <b>{uid}</b>", parse_mode="HTML")
 
-# Звёзды — лоты 20/60/120/300 → 30/100/200/500 токенов
+
+# ──────────────────────────── Команда /give_tokens (для админа) ────────────────────────────
+ADMIN_IDS = {683135069}  # ← сюда впиши свой Telegram ID (через запятую, если несколько)
+
+@dp.message(Command("give_tokens"))
+async def cmd_give_tokens(message: types.Message):
+    # Проверяем, админ ли отправитель
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ У вас нет прав для использования этой команды.")
+        return
+
+    parts = message.text.split()
+    if len(parts) != 3:
+        await message.answer("⚙️ Использование: <code>/give_tokens user_id amount</code>", parse_mode="HTML")
+        return
+
+    try:
+        target_id = int(parts[1])
+        amount = int(parts[2])
+    except ValueError:
+        await message.answer("❌ ID и количество должны быть числами.")
+        return
+
+    # Проверяем, есть ли такой пользователь в БД
+    user = await db.get_user(target_id)
+    if not user:
+        await message.answer("⚠️ Пользователь с таким ID не найден в базе.")
+        return
+
+    # Начисляем токены
+    await db.add_generations(target_id, amount)
+
+    # Уведомляем
+    await message.answer(f"✅ Пользователю <b>{target_id}</b> начислено <b>{amount}</b> токенов.", parse_mode="HTML")
+    try:
+        await bot.send_message(target_id, f"🎁 Вам начислено <b>{amount}</b> токенов администратором.", parse_mode="HTML")
+    except Exception:
+        pass
+
+# ───── Stars: пакеты 20/60/120/300 → 30/100/200/500 токенов ─────
 STAR_PACKS = {
     "20":  {"stars": 20,  "tokens": 30,  "title": "⭐ 20 звёзд → 30 токенов"},
     "60":  {"stars": 60,  "tokens": 100, "title": "⭐ 60 звёзд → 100 токенов"},
@@ -544,7 +571,7 @@ async def pay_stars_cb(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("stars_"))
 async def stars_package_cb(callback: CallbackQuery):
     uid = callback.from_user.id
-    pack = callback.data.split("_")[1]  # "20" | "60" | "120" | "300"
+    pack = callback.data.split("_")[1]
 
     if pack not in STAR_PACKS:
         await callback.answer("❌ Неверный пакет", show_alert=True)
@@ -552,7 +579,6 @@ async def stars_package_cb(callback: CallbackQuery):
 
     pkg = STAR_PACKS[pack]
 
-    # payload для идемпотентности/начисления
     payload = json.dumps({
         "kind": "stars_pack",
         "pack": pack,
@@ -577,10 +603,9 @@ async def stars_package_cb(callback: CallbackQuery):
     )
     LAST_INVOICE_MSG[uid] = msg.message_id
 
-# ────────────── Payments: pre-checkout + successful_payment ────────────
+# Payments: pre-checkout + successful_payment (Stars)
 @dp.pre_checkout_query()
 async def on_pre_checkout(pcq: PreCheckoutQuery):
-    # Ответить ≤ 10 сек
     try:
         await bot.answer_pre_checkout_query(pcq.id, ok=True)
     except Exception:
@@ -592,14 +617,13 @@ async def on_successful_stars_payment(message: Message):
     if not sp or sp.currency != "XTR":
         return
 
-    # разбираем payload
     try:
         payload = json.loads(sp.invoice_payload or "{}")
     except Exception:
         payload = {}
 
     uid = message.from_user.id
-    stars_paid = int(sp.total_amount)  # сколько ⭐ списано
+    stars_paid = int(sp.total_amount)
     charge_id = sp.telegram_payment_charge_id
     tokens = int(payload.get("tokens") or 0)
     pack_stars_declared = int(payload.get("stars") or 0)
@@ -610,7 +634,6 @@ async def on_successful_stars_payment(message: Message):
         )
 
     applied = False
-    # Надёжный путь — метод БД apply_star_payment (уникальный charge_id)
     try:
         if hasattr(db, "apply_star_payment"):
             applied = await db.apply_star_payment(
@@ -621,7 +644,6 @@ async def on_successful_stars_payment(message: Message):
                 raw_payload=payload,
             )
         else:
-            # Fallback на время жизни процесса
             if charge_id in APPLIED_CHARGES:
                 applied = False
             else:
@@ -644,7 +666,7 @@ async def on_successful_stars_payment(message: Message):
     else:
         await message.answer("ℹ️ Этот платёж уже был учтён ранее.")
 
-    # Удаляем чек (это текущее сообщение) и инвойс из чата для «чистоты»
+    # Удаляем чек (текущее сообщение) и инвойс Stars
     try:
         await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
     except Exception:
@@ -655,6 +677,106 @@ async def on_successful_stars_payment(message: Message):
             await bot.delete_message(chat_id=message.chat.id, message_id=mid)
         except Exception:
             pass
+
+# ───── YooKassa: Рубли без вебхуков (поллинг статуса) ─────
+RUB_PACKS = {
+    "30":  {"rubles": 30,  "tokens": 30},
+    "100": {"rubles": 100, "tokens": 100},
+    "200": {"rubles": 200, "tokens": 200},
+    "500": {"rubles": 500, "tokens": 500},
+}
+
+def create_yookassa_payment(amount_rub: int, user_id: int, tokens: int):
+    payment = Payment.create({
+        "amount": {"value": f"{amount_rub:.2f}", "currency": "RUB"},
+        "confirmation": {"type": "redirect", "return_url": YOOKASSA_RETURN_URL},
+        "capture": True,
+        "description": f"Пополнение {amount_rub}₽ ({tokens} токенов) пользователем {user_id}",
+        "metadata": {"user_id": user_id, "tokens": tokens},
+        "receipt": {
+            "customer": {
+                "email": "antipingv2003@gmail.com"  # или телефон: "phone": "+79998887766"
+            },
+            "items": [{
+                "description": f"{tokens} токенов",
+                "quantity": "1.0",
+                "amount": {"value": f"{amount_rub:.2f}", "currency": "RUB"},
+                "vat_code": "1"  # 1 — без НДС
+            }]
+        }
+    })
+    return payment.confirmation.confirmation_url, payment.id
+
+
+async def check_yookassa_payment(payment_id: str, user_id: int, tokens: int):
+    """
+    Ожидаем платёж (опрос раз в 10с, максимум 5 минут).
+    Начисляем токены при статусе succeeded.
+    """
+    try:
+        for _ in range(30):
+            payment = await asyncio.to_thread(Payment.find_one, payment_id)
+            status = getattr(payment, "status", None)
+            if status == "succeeded":
+                await db.add_generations(user_id, tokens)
+                await bot.send_message(user_id, f"✅ Оплата {payment.amount.value}₽ получена.\n🪙 Начислено {tokens} токенов.")
+                return True
+            if status in ("canceled", "expired"):
+                await bot.send_message(user_id, "❌ Оплата не завершена или отменена.")
+                return False
+            await asyncio.sleep(10)
+        await bot.send_message(user_id, "⌛ Время ожидания оплаты истекло. Если оплатили — напишите в поддержку.")
+        return False
+    except Exception:
+        logging.exception("Ошибка при проверке статуса YooKassa")
+        await bot.send_message(user_id, "❌ Ошибка при проверке оплаты. Если списало — свяжитесь с поддержкой.")
+        return False
+
+@dp.callback_query(F.data == "pay_rub")
+async def pay_rub_cb(callback: CallbackQuery, state: FSMContext):
+    # Показ пакетов Рубли→Токены
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💵 {RUB_PACKS['30']['rubles']}₽ → {RUB_PACKS['30']['tokens']} токенов",   callback_data="rubles_30")],
+        [InlineKeyboardButton(text=f"💵 {RUB_PACKS['100']['rubles']}₽ → {RUB_PACKS['100']['tokens']} токенов", callback_data="rubles_100")],
+        [InlineKeyboardButton(text=f"💵 {RUB_PACKS['200']['rubles']}₽ → {RUB_PACKS['200']['tokens']} токенов", callback_data="rubles_200")],
+        [InlineKeyboardButton(text=f"💵 {RUB_PACKS['500']['rubles']}₽ → {RUB_PACKS['500']['tokens']} токенов", callback_data="rubles_500")],
+        [back_btn("top_up_balance")]
+    ])
+    await callback.message.edit_text("💵 Выберите пакет для пополнения (YooKassa):", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("rubles_"))
+async def rubles_package_cb(callback: CallbackQuery):
+    if not (YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY):
+        await callback.answer("YooKassa не настроена", show_alert=True)
+        return
+
+    uid = callback.from_user.id
+    pack = callback.data.split("_")[1]  # "30" | "100" | "200" | "500"
+
+    if pack not in RUB_PACKS:
+        await callback.answer("❌ Неверный пакет", show_alert=True)
+        return
+    pkg = RUB_PACKS[pack]
+
+    try:
+        # создаём платёж (SDK синхронный → оборачиваем в to_thread)
+        pay_url, pay_id = await asyncio.to_thread(create_yookassa_payment, pkg["rubles"], uid, pkg["tokens"])
+        await callback.message.edit_text(
+            f"💳 Счёт на {pkg['rubles']}₽ создан.\n"
+            "Перейдите по кнопке ниже, чтобы оплатить.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="💰 Оплатить в YooKassa", url=pay_url)],
+                    [back_btn("pay_rub")]
+                ]
+            )
+        )
+        # запускаем проверку статуса
+        asyncio.create_task(check_yookassa_payment(pay_id, uid, pkg["tokens"]))
+
+    except Exception:
+        logging.exception("Ошибка при создании платежа YooKassa")
+        await callback.message.edit_text("❌ Не удалось создать платёж. Попробуйте позже.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[back_btn("pay_rub")]]))
 
 # ───────────────────────── Интеграция с KIE ───────────────────────────
 def _input_payload(prompt: str, duration: int, orientation: str,
