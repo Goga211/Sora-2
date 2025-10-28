@@ -95,8 +95,7 @@ def subscribe_keyboard() -> InlineKeyboardMarkup:
     url = CHANNEL_URL or (f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}" if CHANNEL_USERNAME else None)
     buttons = [
         [InlineKeyboardButton(text="📢 Подписаться на канал", url=url or "https://t.me/")],
-        [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")],
-        [back_btn("back_to_main")]
+        [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -301,7 +300,15 @@ async def on_check_sub(callback: CallbackQuery, state: FSMContext):
     if await is_user_subscribed(uid):
         await callback.message.edit_text("Спасибо за подписку! Доступ открыт ✅\nНажмите «🎬 Создать видео».")
         try:
-            await callback.message.answer("🏠 Главное меню:", reply_markup=get_reply_keyboard())
+            text = (
+                "👋 Привет! Я делаю видео с помощью Sora 2.\n\n"
+                "1️⃣ Тип: Текст→Видео или Фото→Видео\n"
+                "2️⃣ Модель: Sora 2 / Sora 2 Pro (Стандарт/Высокое)\n"
+                "3️⃣ Выбери длительность и ориентацию\n"
+                "4️⃣ Опиши сцену — и готово!\n\n"
+                "💳 Пополнить — внизу (⭐ или 💵). Баланс — «💰 Баланс»."
+            )
+            await callback.message.answer(text, reply_markup=get_reply_keyboard())
         except Exception:
             pass
     else:
