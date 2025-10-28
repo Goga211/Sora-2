@@ -566,7 +566,7 @@ async def pay_stars_cb(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text=STAR_PACKS["300"]["title"],  callback_data="stars_300")],
         [back_btn("top_up_balance")]
     ])
-    await callback.message.edit_text("⭐ Выберите пакет для пополнения:", reply_markup=kb)
+    await callback.message.edit_text("⭐ Выберите пакет для пополнения:\nДешево звезды можно купить тут - @cheapiest_star_bot", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("stars_"))
 async def stars_package_cb(callback: CallbackQuery):
