@@ -5,6 +5,8 @@ import logging
 import aiohttp
 from dotenv import load_dotenv
 from typing import Dict, Set
+from aiogram.enums import ChatMemberStatus
+
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -50,6 +52,18 @@ if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
     Configuration.account_id = YOOKASSA_SHOP_ID
     Configuration.secret_key = YOOKASSA_SECRET_KEY
 
+# Канал для обязательной подписки
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")
+CHANNEL_URL = os.getenv("CHANNEL_URL", "")
+
+def _channel_ref():
+    return CHANNEL_ID if CHANNEL_ID != 0 else (CHANNEL_USERNAME if CHANNEL_USERNAME else None)
+
+if not _channel_ref():
+    logging.warning("⚠️ Проверка подписки включена, но не задан CHANNEL_ID/CHANNEL_USERNAME.")
+
+
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -71,6 +85,41 @@ class VideoCreationStates(StatesGroup):
 
 class BalanceStates(StatesGroup):
     waiting_for_payment_method = State()
+
+def subscribe_keyboard() -> InlineKeyboardMarkup:
+    """
+    Две кнопки:
+    - Подписаться на канал (URL)
+    - Я подписался (callback повторной проверки)
+    """
+    url = CHANNEL_URL or (f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}" if CHANNEL_USERNAME else None)
+    buttons = [
+        [InlineKeyboardButton(text="📢 Подписаться на канал", url=url or "https://t.me/")],
+        [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")],
+        [back_btn("back_to_main")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+async def is_user_subscribed(user_id: int) -> bool:
+    """
+    True — если пользователь подписан (member/admin/owner).
+    ВАЖНО: бот должен быть админом в канале.
+    """
+    chat = _channel_ref()
+    if not chat:
+        return True  # если канал не задан — пропускаем проверку
+    try:
+        member = await bot.get_chat_member(chat_id=chat, user_id=user_id)
+        return member.status in {
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.CREATOR,
+        }
+    except Exception as e:
+        logging.exception(f"get_chat_member failed: {e}")
+        # на ошибке лучше подстраховаться и не пускать
+        return False
+
 
 # ──────────────────────────── Цены генераций ──────────────────────────
 def calc_cost_credits(tier: str, quality: str | None, duration: int) -> int:
@@ -198,6 +247,15 @@ async def cmd_start(message: types.Message):
     uid = message.from_user.id
     if not await db.get_user(uid):
         await db.create_user(uid)
+
+    # 👇 Проверка подписки
+    if not await is_user_subscribed(uid):
+        await message.answer(
+            "Чтобы пользоваться ботом, подпишись на канал и нажми «Я подписался».",
+            reply_markup=subscribe_keyboard()
+        )
+        return
+
     text = (
         "👋 Привет! Я делаю видео с помощью Sora 2.\n\n"
         "1️⃣ Тип: Текст→Видео или Фото→Видео\n"
@@ -208,14 +266,23 @@ async def cmd_start(message: types.Message):
     )
     await message.answer(text, reply_markup=get_reply_keyboard())
 
+
 @dp.message(Command("menu"))
 async def cmd_menu(message: Message):
     await message.answer("Нижнее меню включено.", reply_markup=get_reply_keyboard())
 
-# старт из нижнего меню
 @dp.message(F.text == "🎬 Создать видео")
 async def menu_create_video(message: Message, state: FSMContext):
     uid = message.from_user.id
+
+    # 👇 Проверка подписки
+    if not await is_user_subscribed(uid):
+        await message.answer(
+            "Чтобы создать видео, сначала подпишись на канал.", 
+            reply_markup=subscribe_keyboard()
+        )
+        return
+
     if not await db.has_generations(uid):
         await message.answer("❌ У вас нет токенов. Нажмите «💳 Пополнить баланс».")
         return
@@ -226,6 +293,20 @@ async def menu_create_video(message: Message, state: FSMContext):
         image_url=None, prompt=None, cost=None, kie_model=None
     )
     await message.answer("Выберите тип промпта:", reply_markup=get_prompt_type_keyboard())
+
+
+@dp.callback_query(F.data == "check_sub")
+async def on_check_sub(callback: CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    if await is_user_subscribed(uid):
+        await callback.message.edit_text("Спасибо за подписку! Доступ открыт ✅\nНажмите «🎬 Создать видео».")
+        try:
+            await callback.message.answer("🏠 Главное меню:", reply_markup=get_reply_keyboard())
+        except Exception:
+            pass
+    else:
+        await callback.answer("Похоже, подписки всё ещё нет 🤔", show_alert=True)
+
 
 # назад в «главное»
 @dp.callback_query(F.data == "back_to_main")
