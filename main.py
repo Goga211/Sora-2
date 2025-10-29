@@ -4,9 +4,8 @@ import asyncio
 import logging
 import aiohttp
 from dotenv import load_dotenv
-from typing import Dict, Set
+from typing import Dict, Set, Optional
 from aiogram.enums import ChatMemberStatus
-
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -19,6 +18,9 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+
+# NEW: перехватываем конкретные исключения aiogram
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest, TelegramRetryAfter
 
 # YooKassa (без вебхуков — будем опрашивать статус)
 from yookassa import Configuration, Payment
@@ -63,7 +65,6 @@ def _channel_ref():
 if not _channel_ref():
     logging.warning("⚠️ Проверка подписки включена, но не задан CHANNEL_ID/CHANNEL_USERNAME.")
 
-
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -72,6 +73,109 @@ dp = Dispatcher(storage=storage)
 LAST_INVOICE_MSG: Dict[int, int] = {}
 # Fallback-набор, если в БД нет идемпотентного метода
 APPLIED_CHARGES: Set[str] = set()
+
+# ──────────────────────────── БЕЗОПАСНЫЕ ОБЁРТКИ ──────────────────────
+async def _retry_after_sleep(e: TelegramRetryAfter):
+    try:
+        await asyncio.sleep(max(0, int(e.retry_after)))
+    except Exception:
+        await asyncio.sleep(1)
+
+async def safe_send_message(bot: Bot, chat_id: int, text: str, **kwargs) -> bool:
+    try:
+        await bot.send_message(chat_id, text, **kwargs)
+        return True
+    except TelegramRetryAfter as e:
+        await _retry_after_sleep(e)
+        try:
+            await bot.send_message(chat_id, text, **kwargs)
+            return True
+        except Exception:
+            return False
+    except (TelegramForbiddenError, TelegramBadRequest):
+        return False
+    except Exception:
+        logging.exception("safe_send_message: unexpected")
+        return False
+
+async def safe_send_video(bot: Bot, chat_id: int, video: str, **kwargs) -> bool:
+    try:
+        await bot.send_video(chat_id=chat_id, video=video, **kwargs)
+        return True
+    except TelegramRetryAfter as e:
+        await _retry_after_sleep(e)
+        try:
+            await bot.send_video(chat_id=chat_id, video=video, **kwargs)
+            return True
+        except Exception:
+            return False
+    except (TelegramForbiddenError, TelegramBadRequest):
+        return False
+    except Exception:
+        logging.exception("safe_send_video: unexpected")
+        return False
+
+async def safe_send_invoice(bot: Bot, **kwargs) -> Optional[Message]:
+    try:
+        return await bot.send_invoice(**kwargs)
+    except TelegramRetryAfter as e:
+        await _retry_after_sleep(e)
+        try:
+            return await bot.send_invoice(**kwargs)
+        except Exception:
+            return None
+    except (TelegramForbiddenError, TelegramBadRequest):
+        return None
+    except Exception:
+        logging.exception("safe_send_invoice: unexpected")
+        return None
+
+async def safe_answer(message: Message, text: str, **kwargs) -> bool:
+    return await safe_send_message(message.bot, message.chat.id, text, **kwargs)
+
+async def safe_edit_text(msg: Message, text: str, **kwargs) -> bool:
+    try:
+        await msg.edit_text(text, **kwargs)
+        return True
+    except TelegramRetryAfter as e:
+        await _retry_after_sleep(e)
+        try:
+            await msg.edit_text(text, **kwargs)
+            return True
+        except Exception:
+            return False
+    except (TelegramForbiddenError, TelegramBadRequest):
+        # Например, "message is not modified" или нельзя редактировать — молча игнорируем
+        return False
+    except Exception:
+        logging.exception("safe_edit_text: unexpected")
+        return False
+
+async def safe_edit_reply_markup(msg: Message, **kwargs) -> bool:
+    try:
+        await msg.edit_reply_markup(**kwargs)
+        return True
+    except TelegramRetryAfter as e:
+        await _retry_after_sleep(e)
+        try:
+            await msg.edit_reply_markup(**kwargs)
+            return True
+        except Exception:
+            return False
+    except (TelegramForbiddenError, TelegramBadRequest):
+        return False
+    except Exception:
+        logging.exception("safe_edit_reply_markup: unexpected")
+        return False
+
+async def safe_delete_message(bot: Bot, chat_id: int, message_id: int) -> bool:
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
+    except (TelegramForbiddenError, TelegramBadRequest):
+        return False
+    except Exception:
+        return False
 
 # ──────────────────────────── Состояния ───────────────────────────────
 class VideoCreationStates(StatesGroup):
@@ -119,15 +223,8 @@ async def is_user_subscribed(user_id: int) -> bool:
         # на ошибке лучше подстраховаться и не пускать
         return False
 
-
 # ──────────────────────────── Цены генераций ──────────────────────────
 def calc_cost_credits(tier: str, quality: str | None, duration: int) -> int:
-    """
-    Цены:
-    - Sora 2:             10s → 30,   15s → 35
-    - Sora 2 Pro Standard 10s → 90,   15s → 135
-    - Sora 2 Pro HD       10s → 200,  15s → 400
-    """
     if tier == "sora2":
         return 30 if duration == 10 else 35
     if tier == "sora2_pro":
@@ -161,7 +258,6 @@ def back_btn(data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text="🔙 Назад", callback_data=data)
 
 def get_reply_keyboard() -> ReplyKeyboardMarkup:
-    # Постоянное «нижнее» меню под полем ввода
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🎬 Создать видео")],
@@ -233,7 +329,6 @@ def _map_n_frames(dur: int) -> str:
     return "15" if int(dur) >= 15 else "10"
 
 def _build_kie_model(ptype: str, tier: str, quality: str | None) -> str:
-    # Для Pro качество задаём параметром size, а не в имени модели
     if ptype == "t2v" and tier == "sora2":      return "sora-2-text-to-video"
     if ptype == "i2v" and tier == "sora2":      return "sora-2-image-to-video"
     if ptype == "t2v" and tier == "sora2_pro":  return "sora-2-pro-text-to-video"
@@ -249,7 +344,8 @@ async def cmd_start(message: types.Message):
 
     # 👇 Проверка подписки
     if not await is_user_subscribed(uid):
-        await message.answer(
+        await safe_answer(
+            message,
             "Чтобы пользоваться ботом, подпишись на канал и нажми «Я подписался».",
             reply_markup=subscribe_keyboard()
         )
@@ -263,12 +359,11 @@ async def cmd_start(message: types.Message):
         "4️⃣ Опиши сцену — и готово!\n\n"
         "💳 Пополнить — внизу (⭐ или 💵). Баланс — «💰 Баланс»."
     )
-    await message.answer(text, reply_markup=get_reply_keyboard())
-
+    await safe_answer(message, text, reply_markup=get_reply_keyboard())
 
 @dp.message(Command("menu"))
 async def cmd_menu(message: Message):
-    await message.answer("Нижнее меню включено.", reply_markup=get_reply_keyboard())
+    await safe_answer(message, "Нижнее меню включено.", reply_markup=get_reply_keyboard())
 
 @dp.message(F.text == "🎬 Создать видео")
 async def menu_create_video(message: Message, state: FSMContext):
@@ -276,14 +371,15 @@ async def menu_create_video(message: Message, state: FSMContext):
 
     # 👇 Проверка подписки
     if not await is_user_subscribed(uid):
-        await message.answer(
-            "Чтобы создать видео, сначала подпишись на канал.", 
+        await safe_answer(
+            message,
+            "Чтобы создать видео, сначала подпишись на канал.",
             reply_markup=subscribe_keyboard()
         )
         return
 
     if not await db.has_generations(uid):
-        await message.answer("❌ У вас нет токенов. Нажмите «💳 Пополнить баланс».")
+        await safe_answer(message, "❌ У вас нет токенов. Нажмите «💳 Пополнить баланс».")
         return
     await state.set_state(VideoCreationStates.waiting_for_prompt_type)
     await state.update_data(
@@ -291,34 +387,32 @@ async def menu_create_video(message: Message, state: FSMContext):
         duration=None, orientation=None,
         image_url=None, prompt=None, cost=None, kie_model=None
     )
-    await message.answer("Выберите тип промпта:", reply_markup=get_prompt_type_keyboard())
-
+    await safe_answer(message, "Выберите тип промпта:", reply_markup=get_prompt_type_keyboard())
 
 @dp.callback_query(F.data == "check_sub")
 async def on_check_sub(callback: CallbackQuery, state: FSMContext):
     uid = callback.from_user.id
     if await is_user_subscribed(uid):
-        await callback.message.edit_text("Спасибо за подписку! Доступ открыт ✅\nНажмите «🎬 Создать видео».")
+        await safe_edit_text(callback.message, "Спасибо за подписку! Доступ открыт ✅\nНажмите «🎬 Создать видео».")
+        text = (
+            "👋 Привет! Я делаю видео с помощью Sora 2.\n\n"
+            "1️⃣ Тип: Текст→Видео или Фото→Видео\n"
+            "2️⃣ Модель: Sora 2 / Sora 2 Pro (Стандарт/Высокое)\n"
+            "3️⃣ Выбери длительность и ориентацию\n"
+            "4️⃣ Опиши сцену — и готово!\n\n"
+            "💳 Пополнить — внизу (⭐ или 💵). Баланс — «💰 Баланс»."
+        )
+        await safe_send_message(bot, uid, text, reply_markup=get_reply_keyboard())
+    else:
         try:
-            text = (
-                "👋 Привет! Я делаю видео с помощью Sora 2.\n\n"
-                "1️⃣ Тип: Текст→Видео или Фото→Видео\n"
-                "2️⃣ Модель: Sora 2 / Sora 2 Pro (Стандарт/Высокое)\n"
-                "3️⃣ Выбери длительность и ориентацию\n"
-                "4️⃣ Опиши сцену — и готово!\n\n"
-                "💳 Пополнить — внизу (⭐ или 💵). Баланс — «💰 Баланс»."
-            )
-            await callback.message.answer(text, reply_markup=get_reply_keyboard())
+            await callback.answer("Похоже, подписки всё ещё нет 🤔", show_alert=True)
         except Exception:
             pass
-    else:
-        await callback.answer("Похоже, подписки всё ещё нет 🤔", show_alert=True)
-
 
 # назад в «главное»
 @dp.callback_query(F.data == "back_to_main")
 async def back_to_main(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("🏠 Главное меню. Используйте кнопки внизу.")
+    await safe_edit_text(callback.message, "🏠 Главное меню. Используйте кнопки внизу.")
     await state.clear()
 
 # выбор типа промпта
@@ -327,13 +421,13 @@ async def choose_prompt_type(callback: CallbackQuery, state: FSMContext):
     ptype = "t2v" if callback.data == "ptype_t2v" else "i2v"
     await state.update_data(prompt_type=ptype)
     await state.set_state(VideoCreationStates.waiting_for_model_tier)
-    await callback.message.edit_text("Выберите модель:", reply_markup=get_model_tier_keyboard())
+    await safe_edit_text(callback.message, "Выберите модель:", reply_markup=get_model_tier_keyboard())
 
 # назад с модели к типу
 @dp.callback_query(F.data == "back_to_prompt_type")
 async def back_to_prompt_type(callback: CallbackQuery, state: FSMContext):
     await state.set_state(VideoCreationStates.waiting_for_prompt_type)
-    await callback.message.edit_text("Выберите тип промпта:", reply_markup=get_prompt_type_keyboard())
+    await safe_edit_text(callback.message, "Выберите тип промпта:", reply_markup=get_prompt_type_keyboard())
 
 # выбор модели
 @dp.callback_query(F.data.in_({"tier_sora2", "tier_sora2pro"}))
@@ -342,10 +436,11 @@ async def choose_tier(callback: CallbackQuery, state: FSMContext):
     await state.update_data(tier=tier)
     if tier == "sora2_pro":
         await state.set_state(VideoCreationStates.waiting_for_quality)
-        await callback.message.edit_text("Выберите качество:", reply_markup=get_quality_keyboard())
+        await safe_edit_text(callback.message, "Выберите качество:", reply_markup=get_quality_keyboard())
     else:
         await state.set_state(VideoCreationStates.waiting_for_duration_orientation)
-        await callback.message.edit_text(
+        await safe_edit_text(
+            callback.message,
             duration_price_text(tier, None),
             reply_markup=get_duration_orientation_keyboard(),
             parse_mode="Markdown"
@@ -355,7 +450,7 @@ async def choose_tier(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "back_to_model_tier")
 async def back_to_model_tier(callback: CallbackQuery, state: FSMContext):
     await state.set_state(VideoCreationStates.waiting_for_model_tier)
-    await callback.message.edit_text("Выберите модель:", reply_markup=get_model_tier_keyboard())
+    await safe_edit_text(callback.message, "Выберите модель:", reply_markup=get_model_tier_keyboard())
 
 # выбор качества (только Pro)
 @dp.callback_query(F.data.in_({"qual_std", "qual_high", "quality_next"}))
@@ -364,11 +459,12 @@ async def choose_quality(callback: CallbackQuery, state: FSMContext):
     if callback.data in {"qual_std", "qual_high"}:
         q = "std" if callback.data == "qual_std" else "high"
         await state.update_data(quality=q)
-        await callback.message.edit_reply_markup(reply_markup=get_quality_keyboard(selected=q))
+        await safe_edit_reply_markup(callback.message, reply_markup=get_quality_keyboard(selected=q))
         return
     tier, q = data.get("tier"), data.get("quality")
     await state.set_state(VideoCreationStates.waiting_for_duration_orientation)
-    await callback.message.edit_text(
+    await safe_edit_text(
+        callback.message,
         duration_price_text(tier, q),
         reply_markup=get_duration_orientation_keyboard(),
         parse_mode="Markdown"
@@ -380,10 +476,10 @@ async def back_to_quality_or_tier(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     if data.get("tier") == "sora2_pro":
         await state.set_state(VideoCreationStates.waiting_for_quality)
-        await callback.message.edit_text("Выберите качество:", reply_markup=get_quality_keyboard(selected=data.get("quality")))
+        await safe_edit_text(callback.message, "Выберите качество:", reply_markup=get_quality_keyboard(selected=data.get("quality")))
     else:
         await state.set_state(VideoCreationStates.waiting_for_model_tier)
-        await callback.message.edit_text("Выберите модель:", reply_markup=get_model_tier_keyboard())
+        await safe_edit_text(callback.message, "Выберите модель:", reply_markup=get_model_tier_keyboard())
 
 # выбор длительности
 @dp.callback_query(F.data.startswith("duration_"))
@@ -391,7 +487,8 @@ async def duration_cb(callback: CallbackQuery, state: FSMContext):
     dur = int(callback.data.split("_")[1])
     await state.update_data(duration=dur)
     data = await state.get_data()
-    await callback.message.edit_reply_markup(
+    await safe_edit_reply_markup(
+        callback.message,
         reply_markup=get_duration_orientation_keyboard(
             selected_duration=dur,
             selected_orientation=data.get("orientation")
@@ -405,7 +502,8 @@ async def orientation_cb(callback: CallbackQuery, state: FSMContext):
     o = parts[1] + ":" + parts[2]
     await state.update_data(orientation=o)
     data = await state.get_data()
-    await callback.message.edit_reply_markup(
+    await safe_edit_reply_markup(
+        callback.message,
         reply_markup=get_duration_orientation_keyboard(
             selected_duration=data.get("duration"),
             selected_orientation=o
@@ -417,18 +515,23 @@ async def orientation_cb(callback: CallbackQuery, state: FSMContext):
 async def cont_video(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     if not data.get('duration') or not data.get('orientation'):
-        await callback.answer("❌ Выберите длительность и ориентацию!", show_alert=True)
+        try:
+            await callback.answer("❌ Выберите длительность и ориентацию!", show_alert=True)
+        except Exception:
+            pass
         return
 
     if data.get("prompt_type") == "i2v":
         await state.set_state(VideoCreationStates.waiting_for_image)
-        await callback.message.edit_text(
+        await safe_edit_text(
+            callback.message,
             "📷 Отправьте изображение (как фото, не файл).",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[back_btn("back_to_duration")]])
         )
     else:
         await state.set_state(VideoCreationStates.waiting_for_prompt)
-        await callback.message.edit_text(
+        await safe_edit_text(
+            callback.message,
             "✍️ Введите описание для видео:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[back_btn("back_to_duration")]])
         )
@@ -439,7 +542,8 @@ async def back_to_duration(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     tier, q = data.get("tier"), data.get("quality")
     await state.set_state(VideoCreationStates.waiting_for_duration_orientation)
-    await callback.message.edit_text(
+    await safe_edit_text(
+        callback.message,
         duration_price_text(tier, q),
         reply_markup=get_duration_orientation_keyboard(
             selected_duration=data.get("duration"),
@@ -456,14 +560,15 @@ async def got_image(message: types.Message, state: FSMContext):
     img_url = f"https://api.telegram.org/file/bot{TOKEN}/{file.file_path}"
     await state.update_data(image_url=img_url)
     await state.set_state(VideoCreationStates.waiting_for_prompt)
-    await message.answer(
+    await safe_answer(
+        message,
         "✍️ Добавьте описание.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[back_btn("back_to_duration")]])
     )
 
 @dp.message(VideoCreationStates.waiting_for_image)
 async def got_not_image(message: types.Message, state: FSMContext):
-    await message.answer("Пожалуйста, отправьте картинку как _фото_, не файлом.", parse_mode="Markdown")
+    await safe_answer(message, "Пожалуйста, отправьте картинку как _фото_, не файлом.", parse_mode="Markdown")
 
 # промпт (общий T2V/I2V)
 @dp.message(VideoCreationStates.waiting_for_prompt)
@@ -483,7 +588,7 @@ async def prompt_msg(message: types.Message, state: FSMContext):
     mode_human = "Text→Video" if data.get("prompt_type") == "t2v" else "Image→Video"
 
     info = [
-        "⏳ Генерация может занять до 15 минут."
+        "⏳ Генерация может занять до 15 минут.",
         "📋 Подтвердите параметры:",
         f"Тип: {mode_human}",
         f"Модель: {tier_human}{quality_human}",
@@ -493,13 +598,14 @@ async def prompt_msg(message: types.Message, state: FSMContext):
         "",
         f"📝 {prompt}"
     ]
-    await message.answer("\n".join(info), reply_markup=get_confirmation_keyboard())
+    await safe_answer(message, "\n".join(info), reply_markup=get_confirmation_keyboard())
 
 # назад с подтверждения → prompt
 @dp.callback_query(F.data == "back_to_prompt")
 async def back_to_prompt(callback: CallbackQuery, state: FSMContext):
     await state.set_state(VideoCreationStates.waiting_for_prompt)
-    await callback.message.edit_text(
+    await safe_edit_text(
+        callback.message,
         "✍️ Измените описание:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[back_btn("back_to_duration")]])
     )
@@ -510,7 +616,8 @@ async def change_video(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     tier, q = data.get("tier"), data.get("quality")
     await state.set_state(VideoCreationStates.waiting_for_duration_orientation)
-    await callback.message.edit_text(
+    await safe_edit_text(
+        callback.message,
         duration_price_text(tier, q),
         reply_markup=get_duration_orientation_keyboard(
             selected_duration=data.get("duration"),
@@ -529,15 +636,13 @@ async def confirm_video(callback: CallbackQuery, state: FSMContext):
 
     if not user or user["generations_left"] < cost:
         bal = user["generations_left"] if user else 0
-        await callback.message.edit_text(
-            f"❌ Недостаточно токенов.\nНужно {cost}, у вас {bal}."
-        )
+        await safe_edit_text(callback.message, f"❌ Недостаточно токенов.\nНужно {cost}, у вас {bal}.")
         await state.clear()
         return
 
     # списание ровно cost
     await db.update_user_generations(uid, user["generations_left"] - cost)
-    await callback.message.edit_text(f"🎬 Видео создаётся…\n💳 Списано {cost} токенов.")
+    await safe_edit_text(callback.message, f"🎬 Видео создаётся…\n💳 Списано {cost} токенов.")
 
     try:
         await send_to_kie_api(
@@ -563,7 +668,7 @@ async def menu_check_balance(message: Message):
     uid = message.from_user.id
     user = await db.get_user(uid)
     txt = f"💰 Ваш баланс:\n\n🪙 Токенов: {user['generations_left']}" if user else "❌ Пользователь не найден"
-    await message.answer(txt)
+    await safe_answer(message, txt)
 
 @dp.message(F.text == "💳 Пополнить баланс")
 async def menu_top_up_balance(message: Message, state: FSMContext):
@@ -572,7 +677,7 @@ async def menu_top_up_balance(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="💵 Рубли (YooKassa)", callback_data="pay_rub")],
         [back_btn("back_to_main")],
     ])
-    await message.answer("💳 Выберите способ пополнения:", reply_markup=kb)
+    await safe_answer(message, "💳 Выберите способ пополнения:", reply_markup=kb)
     await state.set_state(BalanceStates.waiting_for_payment_method)
 
 @dp.callback_query(F.data == "check_balance")
@@ -580,7 +685,7 @@ async def check_balance_cb(callback: CallbackQuery):
     uid = callback.from_user.id
     user = await db.get_user(uid)
     txt = f"💰 Ваш баланс:\n\n🪙 Токенов: {user['generations_left']}" if user else "❌ Пользователь не найден"
-    await callback.message.edit_text(txt)
+    await safe_edit_text(callback.message, txt)
 
 @dp.callback_query(F.data == "top_up_balance")
 async def top_up_balance_cb(callback: CallbackQuery, state: FSMContext):
@@ -589,53 +694,45 @@ async def top_up_balance_cb(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="💵 Рубли (YooKassa)", callback_data="pay_rub")],
         [back_btn("back_to_main")]
     ])
-    await callback.message.edit_text("💳 Выберите способ пополнения:", reply_markup=kb)
+    await safe_edit_text(callback.message, "💳 Выберите способ пополнения:", reply_markup=kb)
     await state.set_state(BalanceStates.waiting_for_payment_method)
 
 # ──────────────────────────── Команда /get_id ────────────────────────────
 @dp.message(Command("get_id"))
 async def cmd_get_id(message: types.Message):
     uid = message.from_user.id
-    await message.answer(f"🆔 Ваш Telegram ID: <b>{uid}</b>", parse_mode="HTML")
-
+    await safe_answer(message, f"🆔 Ваш Telegram ID: <b>{uid}</b>", parse_mode="HTML")
 
 # ──────────────────────────── Команда /give_tokens (для админа) ────────────────────────────
 ADMIN_IDS = {683135069}  # ← сюда впиши свой Telegram ID (через запятую, если несколько)
 
 @dp.message(Command("give_tokens"))
 async def cmd_give_tokens(message: types.Message):
-    # Проверяем, админ ли отправитель
     if message.from_user.id not in ADMIN_IDS:
-        await message.answer("❌ У вас нет прав для использования этой команды.")
+        await safe_answer(message, "❌ У вас нет прав для использования этой команды.")
         return
 
     parts = message.text.split()
     if len(parts) != 3:
-        await message.answer("⚙️ Использование: <code>/give_tokens user_id amount</code>", parse_mode="HTML")
+        await safe_answer(message, "⚙️ Использование: <code>/give_tokens user_id amount</code>", parse_mode="HTML")
         return
 
     try:
         target_id = int(parts[1])
         amount = int(parts[2])
     except ValueError:
-        await message.answer("❌ ID и количество должны быть числами.")
+        await safe_answer(message, "❌ ID и количество должны быть числами.")
         return
 
-    # Проверяем, есть ли такой пользователь в БД
     user = await db.get_user(target_id)
     if not user:
-        await message.answer("⚠️ Пользователь с таким ID не найден в базе.")
+        await safe_answer(message, "⚠️ Пользователь с таким ID не найден в базе.")
         return
 
-    # Начисляем токены
     await db.add_generations(target_id, amount)
 
-    # Уведомляем
-    await message.answer(f"✅ Пользователю <b>{target_id}</b> начислено <b>{amount}</b> токенов.", parse_mode="HTML")
-    try:
-        await bot.send_message(target_id, f"🎁 Вам начислено <b>{amount}</b> токенов администратором.", parse_mode="HTML")
-    except Exception:
-        pass
+    await safe_answer(message, f"✅ Пользователю <b>{target_id}</b> начислено <b>{amount}</b> токенов.", parse_mode="HTML")
+    await safe_send_message(bot, target_id, f"🎁 Вам начислено <b>{amount}</b> токенов администратором.", parse_mode="HTML")
 
 # ───── Stars: пакеты 20/60/120/300 → 30/100/200/500 токенов ─────
 STAR_PACKS = {
@@ -654,7 +751,7 @@ async def pay_stars_cb(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text=STAR_PACKS["300"]["title"],  callback_data="stars_300")],
         [back_btn("top_up_balance")]
     ])
-    await callback.message.edit_text("⭐ Выберите пакет для пополнения:\nДешево звезды можно купить тут - @cheapiest_star_bot", reply_markup=kb)
+    await safe_edit_text(callback.message, "⭐ Выберите пакет для пополнения:\nДешево звезды можно купить тут - @cheapiest_star_bot", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("stars_"))
 async def stars_package_cb(callback: CallbackQuery):
@@ -662,7 +759,10 @@ async def stars_package_cb(callback: CallbackQuery):
     pack = callback.data.split("_")[1]
 
     if pack not in STAR_PACKS:
-        await callback.answer("❌ Неверный пакет", show_alert=True)
+        try:
+            await callback.answer("❌ Неверный пакет", show_alert=True)
+        except Exception:
+            pass
         return
 
     pkg = STAR_PACKS[pack]
@@ -675,10 +775,10 @@ async def stars_package_cb(callback: CallbackQuery):
         "uid": uid
     })
 
-    # Stars: provider_token="" и currency="XTR"; prices — ровно один элемент
     prices = [LabeledPrice(label=f"{pkg['stars']} ⭐", amount=pkg["stars"])]
 
-    msg = await bot.send_invoice(
+    msg = await safe_send_invoice(
+        bot,
         chat_id=uid,
         title="Пополнение токенов",
         description=f"{pkg['stars']} ⭐ → {pkg['tokens']} токенов",
@@ -689,7 +789,8 @@ async def stars_package_cb(callback: CallbackQuery):
         start_parameter=f"stars_{pack}_{uid}",
         is_flexible=False,
     )
-    LAST_INVOICE_MSG[uid] = msg.message_id
+    if msg:
+        LAST_INVOICE_MSG[uid] = msg.message_id
 
 # Payments: pre-checkout + successful_payment (Stars)
 @dp.pre_checkout_query()
@@ -747,24 +848,19 @@ async def on_successful_stars_payment(message: Message):
             logging.exception("add_generations fallback error")
 
     if applied:
-        await message.answer(
+        await safe_answer(
+            message,
             f"✅ Оплата получена: {stars_paid} ⭐\n"
             f"🪙 Начислено: {tokens} токенов\nСпасибо! 🎉"
         )
     else:
-        await message.answer("ℹ️ Этот платёж уже был учтён ранее.")
+        await safe_answer(message, "ℹ️ Этот платёж уже был учтён ранее.")
 
     # Удаляем чек (текущее сообщение) и инвойс Stars
-    try:
-        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
-    except Exception:
-        pass
+    await safe_delete_message(bot, message.chat.id, message.message_id)
     mid = LAST_INVOICE_MSG.pop(uid, None)
     if mid:
-        try:
-            await bot.delete_message(chat_id=message.chat.id, message_id=mid)
-        except Exception:
-            pass
+        await safe_delete_message(bot, message.chat.id, mid)
 
 # ───── YooKassa: Рубли без вебхуков (поллинг статуса) ─────
 RUB_PACKS = {
@@ -783,46 +879,40 @@ def create_yookassa_payment(amount_rub: int, user_id: int, tokens: int):
         "metadata": {"user_id": user_id, "tokens": tokens},
         "receipt": {
             "customer": {
-                "email": "antipingv2003@gmail.com"  # или телефон: "phone": "+79998887766"
+                "email": "antipingv2003@gmail.com"
             },
             "items": [{
                 "description": f"{tokens} токенов",
                 "quantity": "1.0",
                 "amount": {"value": f"{amount_rub:.2f}", "currency": "RUB"},
-                "vat_code": "1"  # 1 — без НДС
+                "vat_code": "1"
             }]
         }
     })
     return payment.confirmation.confirmation_url, payment.id
 
-
 async def check_yookassa_payment(payment_id: str, user_id: int, tokens: int):
-    """
-    Ожидаем платёж (опрос раз в 10с, максимум 5 минут).
-    Начисляем токены при статусе succeeded.
-    """
     try:
         for _ in range(30):
             payment = await asyncio.to_thread(Payment.find_one, payment_id)
             status = getattr(payment, "status", None)
             if status == "succeeded":
                 await db.add_generations(user_id, tokens)
-                await bot.send_message(user_id, f"✅ Оплата {payment.amount.value}₽ получена.\n🪙 Начислено {tokens} токенов.")
+                await safe_send_message(bot, user_id, f"✅ Оплата {payment.amount.value}₽ получена.\n🪙 Начислено {tokens} токенов.")
                 return True
             if status in ("canceled", "expired"):
-                await bot.send_message(user_id, "❌ Оплата не завершена или отменена.")
+                await safe_send_message(bot, user_id, "❌ Оплата не завершена или отменена.")
                 return False
             await asyncio.sleep(10)
-        await bot.send_message(user_id, "⌛ Время ожидания оплаты истекло. Если оплатили — напишите в поддержку.")
+        await safe_send_message(bot, user_id, "⌛ Время ожидания оплаты истекло. Если оплатили — напишите в поддержку.")
         return False
     except Exception:
         logging.exception("Ошибка при проверке статуса YooKassa")
-        await bot.send_message(user_id, "❌ Ошибка при проверке оплаты. Если списало — свяжитесь с поддержкой.")
+        await safe_send_message(bot, user_id, "❌ Ошибка при проверке оплаты. Если списало — свяжитесь с поддержкой.")
         return False
 
 @dp.callback_query(F.data == "pay_rub")
 async def pay_rub_cb(callback: CallbackQuery, state: FSMContext):
-    # Показ пакетов Рубли→Токены
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"💵 {RUB_PACKS['30']['rubles']}₽ → {RUB_PACKS['30']['tokens']} токенов",   callback_data="rubles_30")],
         [InlineKeyboardButton(text=f"💵 {RUB_PACKS['100']['rubles']}₽ → {RUB_PACKS['100']['tokens']} токенов", callback_data="rubles_100")],
@@ -830,26 +920,32 @@ async def pay_rub_cb(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text=f"💵 {RUB_PACKS['500']['rubles']}₽ → {RUB_PACKS['500']['tokens']} токенов", callback_data="rubles_500")],
         [back_btn("top_up_balance")]
     ])
-    await callback.message.edit_text("💵 Выберите пакет для пополнения (YooKassa):", reply_markup=kb)
+    await safe_edit_text(callback.message, "💵 Выберите пакет для пополнения (YooKassa):", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("rubles_"))
 async def rubles_package_cb(callback: CallbackQuery):
     if not (YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY):
-        await callback.answer("YooKassa не настроена", show_alert=True)
+        try:
+            await callback.answer("YooKassa не настроена", show_alert=True)
+        except Exception:
+            pass
         return
 
     uid = callback.from_user.id
     pack = callback.data.split("_")[1]  # "30" | "100" | "200" | "500"
 
     if pack not in RUB_PACKS:
-        await callback.answer("❌ Неверный пакет", show_alert=True)
+        try:
+            await callback.answer("❌ Неверный пакет", show_alert=True)
+        except Exception:
+            pass
         return
     pkg = RUB_PACKS[pack]
 
     try:
-        # создаём платёж (SDK синхронный → оборачиваем в to_thread)
         pay_url, pay_id = await asyncio.to_thread(create_yookassa_payment, pkg["rubles"], uid, pkg["tokens"])
-        await callback.message.edit_text(
+        await safe_edit_text(
+            callback.message,
             f"💳 Счёт на {pkg['rubles']}₽ создан.\n"
             "Перейдите по кнопке ниже, чтобы оплатить.",
             reply_markup=InlineKeyboardMarkup(
@@ -859,23 +955,18 @@ async def rubles_package_cb(callback: CallbackQuery):
                 ]
             )
         )
-        # запускаем проверку статуса
         asyncio.create_task(check_yookassa_payment(pay_id, uid, pkg["tokens"]))
-
     except Exception:
         logging.exception("Ошибка при создании платежа YooKassa")
-        await callback.message.edit_text("❌ Не удалось создать платёж. Попробуйте позже.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[back_btn("pay_rub")]]))
+        await safe_edit_text(
+            callback.message,
+            "❌ Не удалось создать платёж. Попробуйте позже.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[back_btn("pay_rub")]])
+        )
 
 # ───────────────────────── Интеграция с KIE ───────────────────────────
 def _input_payload(prompt: str, duration: int, orientation: str,
                    image_url: str | None, tier: str, quality: str | None):
-    """
-    Формируем тело input:
-    - n_frames, remove_watermark, prompt
-    - aspect_ratio (всегда)
-    - size ('standard' | 'high') для Sora 2 Pro
-    - image_urls при I2V
-    """
     p: dict = {
         "prompt": prompt,
         "n_frames": _map_n_frames(duration),
@@ -907,7 +998,7 @@ async def send_to_kie_api(uid: int, model: str, prompt: str, duration: int,
     except Exception:
         logging.exception("Ошибка при отправке в KIE")
         await db.add_generations(uid, cost)
-        await bot.send_message(uid, "❌ Не удалось создать задачу. Токены возвращены.")
+        await safe_send_message(bot, uid, "❌ Не удалось создать задачу. Токены возвращены.")
         raise
 
     asyncio.create_task(check_video_status(uid, task_id, duration, orientation, cost))
@@ -954,28 +1045,28 @@ async def check_video_status(uid: int, task_id: str, duration: int, orientation:
                                 pass
 
                         line_orient = f", 📱 {orientation}" if orientation else ""
-                        await bot.send_message(uid, f"🎉 Ваше видео готово! ⏱️ {duration} с{line_orient}")
+                        await safe_send_message(bot, uid, f"🎉 Ваше видео готово! ⏱️ {duration} с{line_orient}")
                         if video_url:
-                            await bot.send_video(chat_id=uid, video=video_url, caption="🎬 Готовый ролик")
+                            await safe_send_video(bot, uid, video_url, caption="🎬 Готовый ролик")
                         else:
-                            await bot.send_message(uid, "⚠️ Видео готово, но URL не найден в ответе.")
+                            await safe_send_message(bot, uid, "⚠️ Видео готово, но URL не найден в ответе.")
                         return
 
                     # ошибка
                     fail_msg = d.get("failMsg") or d.get("errorMessage") or "Ошибка генерации"
                     await db.add_generations(uid, cost)
-                    await bot.send_message(uid, f"❌ Генерация не удалась: {fail_msg}. Токены возвращены.")
+                    await safe_send_message(bot, uid, f"❌ Генерация не удалась: {fail_msg}. Токены возвращены.")
                     return
 
                 await asyncio.sleep(8)
 
             # таймаут
             await db.add_generations(uid, cost)
-            await bot.send_message(uid, "⏳ Истекло время ожидания. Токены возвращены.")
+            await safe_send_message(bot, uid, "⏳ Истекло время ожидания. Токены возвращены.")
     except Exception:
         logging.exception("Ошибка при проверке статуса видео")
         await db.add_generations(uid, cost)
-        await bot.send_message(uid, "❌ Ошибка при генерации. Токены возвращены.")
+        await safe_send_message(bot, uid, "❌ Ошибка при генерации. Токены возвращены.")
 
 # ───────────────────────────── Точка входа ────────────────────────────
 async def main():
